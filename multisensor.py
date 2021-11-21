@@ -8,6 +8,9 @@ import glob
 import time
 import datetime
 import sys
+from ctypes import c_short
+from ctypes import c_byte
+from ctypes import c_ubyte
 
 import tkinter
 from tkinter import *
@@ -15,7 +18,9 @@ from tkinter import ttk
 
 import board
 import busio
-import adafruit_bmp280            #has nearly a temperature shift of 2 degree Celsius
+import smbus
+import adafruit_bmp280
+from adafruit_bme280 import basic as adafruit_bme280              #has nearly a temperature shift of 2 degree Celsius
 #import adafruit_bmp085
 #import adafruit_bmp180
 import adafruit_bmp3xx
@@ -34,7 +39,9 @@ import RPi.GPIO as GPIO
 winOut = True
 shellOut = True
 MQTTout = True
-useBMP280 = True
+useBMP280 = False
+useBME280 = False
+useBME280ext = False
 useBMP3xx = True
 useBMP3xx_SPI = True
 useLightSensor = True
@@ -57,14 +64,114 @@ GPIO.output(relais_2_GPIO, GPIO.LOW)
 # fresh air == O2 intake parameters - in Teilen von 1.0!
 O2concentration = 0.21
 O2minforFreshAir = 0.195
+O2hysteresis = 0.1
 relais_1_status = 1
 GPIO.output(relais_1_GPIO, relais_1_status)
+ventFreshAir = False
 
 # secondary inhouse fan parameters
 airTemp = 20.0
-airTempCooling = 32.0
+airTempCooling = 20    #test only was 32.0
 relais_2_status = 1
 GPIO.output(relais_2_GPIO, relais_2_status)
+
+DEVICE = 0x76  # Standard-Geräteaddresse am I2C
+BUS = smbus.SMBus(1)
+
+def get_short(data, index):
+    return c_short((data[index+1] << 8) + data[index]).value
+
+def get_ushort(data, index):
+    return (data[index+1] << 8) + data[index]
+
+def get_char(data, index):
+    result = data[index]
+    if result > 127:
+        result -= 256
+    return result
+
+def get_uchar(data, index):
+    result = data[index] & 0xFF
+    return result
+
+def read_bme280id(addr=DEVICE):
+    reg_id = 0xD0
+    (chip_id, chip_version) = BUS.read_i2c_block_data(addr, reg_id, 2)
+    return chip_id, chip_version
+
+def read_bme280_all(addr=DEVICE):
+    reg_data = 0xF7
+    reg_control = 0xF4
+    reg_config = 0xF5
+    reg_control_hum = 0xF2
+    reg_hum_msb = 0xFD
+    reg_hum_lsb = 0xFE
+    oversample_temp = 2
+    oversample_pres = 2
+    mode = 1
+    oversample_hum = 2
+    BUS.write_byte_data(addr, reg_control_hum, oversample_hum)
+    control = oversample_temp << 5 | oversample_pres << 2 | mode
+    BUS.write_byte_data(addr, reg_control, control)
+    cal1 = BUS.read_i2c_block_data(addr, 0x88, 24)
+    cal2 = BUS.read_i2c_block_data(addr, 0xA1, 1)
+    cal3 = BUS.read_i2c_block_data(addr, 0xE1, 7)
+    dig_t1 = get_ushort(cal1, 0)
+    dig_t2 = get_short(cal1, 2)
+    dig_t3 = get_short(cal1, 4)
+    dig_p1 = get_ushort(cal1, 6)
+    dig_p2 = get_short(cal1, 8)
+    dig_p3 = get_short(cal1, 10)
+    dig_p4 = get_short(cal1, 12)
+    dig_p5 = get_short(cal1, 14)
+    dig_p6 = get_short(cal1, 16)
+    dig_p7 = get_short(cal1, 18)
+    dig_p8 = get_short(cal1, 20)
+    dig_p9 = get_short(cal1, 22)
+    dig_h1 = get_uchar(cal2, 0)
+    dig_h2 = get_short(cal3, 0)
+    dig_h3 = get_uchar(cal3, 2)
+    dig_h4 = get_char(cal3, 3)
+    dig_h4 = (dig_h4 << 24) >> 20
+    dig_h4 = dig_h4 | (get_char(cal3, 4) & 0x0F)
+    dig_h5 = get_char(cal3, 5)
+    dig_h5 = (dig_h5 << 24) >> 20
+    dig_h5 = dig_h5 | (get_uchar(cal3, 4) >> 4 & 0x0F)
+    dig_h6 = get_char(cal3, 6)
+    wait_time = 1.25 + (2.3 * oversample_temp) + ((2.3 * oversample_pres) + 0.575) + ((2.3 * oversample_hum)+0.575)
+    time.sleep(wait_time/1000)
+    data = BUS.read_i2c_block_data(addr, reg_data, 8)
+    pres_raw = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4)
+    temp_raw = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4)
+    hum_raw = (data[6] << 8) | data[7]
+    var1 = ((((temp_raw>>3)-(dig_t1<<1)))*(dig_t2)) >> 11
+    var2 = (((((temp_raw >> 4) - dig_t1) * ((temp_raw >> 4) - dig_t1)) >> 12) * dig_t3) >> 14
+    t_fine = var1+var2
+    temperature = float(((t_fine * 5) + 128) >> 8)
+    var1 = t_fine / 2.0 - 64000.0
+    var2 = var1 * var1 * dig_p6 / 32768.0
+    var2 = var2 + var1 * dig_p5 * 2.0
+    var2 = var2 / 4.0 + dig_p4 * 65536.0
+    var1 = (dig_p3 * var1 * var1 / 524288.0 + dig_p2 * var1) / 524288.0
+    var1 = (1.0 + var1 / 32768.0) * dig_p1
+    if var1 == 0:
+        pressure = 0
+    else:
+        pressure = 1048576.0 - pres_raw
+        pressure = ((pressure - var2 / 4096.0) * 6250.0) / var1
+        var1 = dig_p9 * pressure * pressure / 2147483648.0
+        var2 = pressure * dig_p8 / 32768.0
+        pressure = pressure + (var1 + var2 + dig_p7) / 16.0
+    humidity = t_fine - 76800.0
+    humidity = (hum_raw - (dig_h4 * 64.0 + dig_h5 / 16384.0 * humidity)) * \
+               (dig_h2 / 65536.0 * (1.0 + dig_h6 / 67108864.0 * humidity * (1.0 + dig_h3 / 67108864.0 * humidity)))
+    humidity = humidity * (1.0 - dig_h1 * humidity / 524288.0)
+    if humidity > 100:
+        humidity = 100
+    elif humidity < 0:
+        humidity = 0
+    return temperature/100.0, pressure/100.0, humidity
+
 
 #grove ADC
 from grove.adc import ADC
@@ -170,8 +277,15 @@ class T6703(object):
         buffer = array.array('B', data)
         return buffer[3]*256+buffer[3]
 
-def debugPrint(st):
+
+def shellPrint(st):
     print(st)
+    
+def debugPrint(st):
+    print(st, file=sys.stderr)
+    
+def exceptionPrint(exc, st):
+    print(exc, st, file=sys.stderr)
     
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
@@ -188,7 +302,7 @@ client.loop_start()
 time.sleep(4)
 #SPI setup
 spi = board.SPI() #board.SCLK, board.MOSI, board.MISO)
-#cs = DigitalInOut(24) #board.D7) #??? was D5
+cs = DigitalInOut(board.CE1) #??? was D5
 #bmp_SPI = adafruit_bmp3xx.BMP3XX_SPI(spi, cs)
 
 # Treiberinstallation
@@ -214,6 +328,8 @@ if useHumiditySensor == True:
 
 if useBMP280 == True:
     sensorBMP280 = adafruit_bmp280.Adafruit_BMP280_I2C(i2c, address=0x76)
+if useBME280 == True:
+    sensorBME280 = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=0x76)
 
 if useBMP3xx == True:
     sensorBMP3xx = adafruit_bmp3xx.BMP3XX_I2C(i2c, address=0x77)
@@ -239,8 +355,8 @@ if useCCS811Sensor == True:
             pass
         temp = ccs811.temperature
         ccs811.temp_offset = temp - 25.0
-    except Exception:
-        debugPrint("CCS811 Exception Start")
+    except Exception as exc:
+        exceptionPrint(exc, "CCS811 Exception Start")
 
 #grove ADC
 from grove.helper import SlotHelper
@@ -256,6 +372,12 @@ O2max = 0.0
 #Netzmafia BMP280
 if useBMP280 == True:
     sensorBMP280.sea_level_pressure = 1013.25
+    ALTITUDE = 210.0
+if useBME280 == True:
+    sensorBME280.sea_level_pressure = 1013.25
+    ALTITUDE = 210.0
+if useBME280ext == True:
+    #sensorBME280.sea_level_pressure = 1013.25
     ALTITUDE = 210.0
 if useBMP3xx == True:
     sensorBMP3xx.sea_level_pressure = 1013.25
@@ -326,9 +448,6 @@ def winClear(tkWin):
     tkWin.delete('1.0', tkinter.END)
 
 
-def shellPrint(st):
-    print(st)
-    
 # Ausgabe
 while True:
     if winOut == True:
@@ -363,7 +482,7 @@ while True:
             pressure_nn = pressure/pow(1 - ALTITUDE/44330.0, 5.255)
             airTemp = temperature = sensorBMP280.temperature
             altitude = sensorBMP280.altitude
-            st1 = "Temperatur:  {0:0.1f} {1:s}C".format(temperature)
+            st1 = "Temperatur:  {0:0.1f} °C".format(temperature)
             st2 = "Luftdruck:   {0:0.1f} hPa".format(pressure)
             st3 = "LuftdruckNN: {0:0.1f} hPa".format(pressure_nn)
             st4 = "Höhe:  {0:0.2f} m".format(altitude)
@@ -382,15 +501,64 @@ while True:
                 client.publish("gwh/pressure", "{0:0.1f}".format(pressure))
                 client.publish("gwh/pressureNN", "{0:0.1f}".format(pressure_nn))
                 client.publish("gwh/altitude", "{0:0.2f}".format(altitude))
-        except Exception:
-            debugPrint("BMP280 Exception")
+        except Exception as exc:
+            exceptionPrint(exc, "BMP280 Exception")
+            
+    # Ausgabe der Messwerte BMP280
+    if useBME280 == True:
+        try:
+            pressure = sensorBME280.pressure
+            pressure_nn = pressure/pow(1 - ALTITUDE/44330.0, 5.255)
+            airTemp = temperature = sensorBME280.temperature
+            altitude = sensorBME280.altitude
+            st1 = "Temperatur:  {0:0.1f} °C".format(temperature)
+            st2 = "Luftdruck:   {0:0.1f} hPa".format(pressure)
+            st3 = "LuftdruckNN: {0:0.1f} hPa".format(pressure_nn)
+            st4 = "Höhe:  {0:0.2f} m".format(altitude)
+            if winOut == True:
+                winPrint(tW, st1)
+                winPrint(tW, st2)
+                winPrint(tW, st3)
+                winPrint(tW, st4)
+            if shellOut == True:
+                shellPrint(st1)
+                shellPrint(st2)
+                shellPrint(st3)
+                shellPrint(st4)
+            if MQTTout:
+                client.publish("gwh/tempBoard", "{0:0.1f}".format(temperature))
+                client.publish("gwh/pressure", "{0:0.1f}".format(pressure))
+                client.publish("gwh/pressureNN", "{0:0.1f}".format(pressure_nn))
+                client.publish("gwh/altitude", "{0:0.2f}".format(altitude))
+        except Exception as exc:
+            exceptionPrint(exc, "BME280 Exception")
+
+     # Ausgabe der Messwerte BMP280
+    if useBME280ext == True:
+        try:
+            temperature, pressure, humidity = read_bme280_all()
+            #pressure_nn = pressure/pow(1 - ALTITUDE/44330.0, 5.255)
+            airTemp = temperature
+            st1 = "Temperatur:  {0:0.1f} °C".format(temperature)
+            st2 = "Luftdruck:   {0:0.1f} hPa".format(pressure)
+            if winOut == True:
+                winPrint(tW, st1)
+                winPrint(tW, st2)
+            if shellOut == True:
+                shellPrint(st1)
+                shellPrint(st2)
+            if MQTTout:
+                client.publish("gwh/tempBoard", "{0:0.1f}".format(temperature))
+                client.publish("gwh/pressure", "{0:0.1f}".format(pressure))
+        except Exception as exc:
+            exceptionPrint(exc, "BME280ext Exception")
 
     if useBMP3xx == True:
         try:
-            pressure = sensorBMP3xx.pressure
-            pressure_nn = pressure/pow(1 - ALTITUDE/44330.0, 5.255)
-            airTemp = temperature = sensorBMP3xx.temperature
-            altitude = sensorBMP3xx.altitude
+            pressure3 = sensorBMP3xx.pressure
+            pressure_nn3 = pressure3/pow(1 - ALTITUDE/44330.0, 5.255)
+            airTemp = temperature3 = sensorBMP3xx.temperature
+            altitude3 = sensorBMP3xx.altitude
             st1 = "Temperatur 3:  {0:0.1f} °C".format(temperature3)
             st2 = "Luftdruck 3:   {0:0.2f} hPa".format(pressure3)
             st3 = "LuftdruckNN 3: {0:0.2f} hPa".format(pressure_nn3)
@@ -410,8 +578,8 @@ while True:
                 client.publish("gwh/pressure3", "{0:0.2f}".format(pressure3))
                 client.publish("gwh/pressureNN3", "{0:0.2f}".format(pressure_nn3))
                 client.publish("gwh/altitude3", "{0:0.2f}".format(altitude3))
-        except Exception:
-            debugPrint("BMP3xx Exception")
+        except Exception as exc:
+            exceptionPrint(exc, "BMP3xx Exception")
 
     if useLightSensor == True:
         try:
@@ -423,8 +591,8 @@ while True:
                 shellPrint(st1)
             if MQTTout:
                 client.publish("gwh/lux", "{0:0.2f}".format(lux))
-        except Exception:
-            debugPrint("LightSensor Exception")
+        except Exception as exc:
+            exceptionPrint(exc, "LightSensor Exception")
    
     if useHumiditySensor == True:
         try:
@@ -441,8 +609,8 @@ while True:
             if MQTTout:
                 client.publish("gwh/temp", "{0:0.1f}".format(tempHum))
                 client.publish("gwh/humidity", "{0:0.1f}".format(relHum))
-        except Exception:
-            debugPrint("Humidity Exception")
+        except Exceptio as exc:
+            exceptionPrint(exc, "Humidity Exception")
     
     # T6703 CO2 Daten
     if useCO2Sensor == True:
@@ -460,8 +628,8 @@ while True:
                     shellPrint(st1)
                 if MQTTout:
                     client.publish("gwh/CO2", "{0:6d}".format(CO2value))
-        except Exception:
-            debugPrint("CO2Sensor Exception")
+        except Exception as exc:
+            exceptionPrint(exc, "CO2Sensor Exception")
     
     if useCCS811Sensor == True:
         try:
@@ -477,8 +645,8 @@ while True:
                 shellPrint(st1)
                 shellPrint(st2)
             #print("TempCCS: {0:0.1f} °C".format(tempCCS))        
-        except Exception:
-            debugPrint("CCS811 Exception")
+        except Exception as exc:
+            exceptionPrint(exc, "CCS811 Exception")
  
     try:
     # O2 sensor
@@ -502,8 +670,8 @@ while True:
             shellPrint(st2)
         if MQTTout:
             client.publish("gwh/O2", "{0:0.3f}".format(O2concentration*100))
-    except Exception:
-        debugPrint("AD O2 Exception")
+    except Exception as exc:
+        exceptionPrint(exc, "AD O2 Exception")
 
     try:
         # Bodenfeuchte per Grove hat
@@ -529,8 +697,8 @@ while True:
         if MQTTout:
             client.publish("gwh/gas", "{:>5.3f}".format(voltGas))
             client.publish("gwh/soilHum", "{:>5.3f}".format(voltSoilHum))
-    except Exception:
-        debugPrint("AD Exception")
+    except Exception as exc:
+        exceptionPrint(exc, "AD soil humidity Exception")
 
 # 1-Wire Sensoren
     try:
@@ -549,17 +717,26 @@ while True:
                 shellPrint(st1)
             if MQTTout:
                 client.publish("gwh/{0}".format(device_name), temp_s)
-    except Exception:
-        debugPrint("1-Wire Exception")
+    except Exception as exc:
+        exceptionPrint(exc, "1-Wire Exception")
         
     #Trigger beachten - sollte low sein
         
-    if O2concentration > O2minforFreshAir:
-        relais_1_status = 1
-        ventFreshAir = False
-    else:
-        relais_1_status = 0
-        ventFreshAir = True
+    if ventFreshAir == True:
+        if O2concentration > O2minforFreshAir + O2hysteresis:
+            relais_1_status = 1
+            ventFreshAir = False
+        else:
+            relais_1_status = 0
+            ventFreshAir = True
+    else:         #ventFreshAir == False
+        if O2concentration > O2minforFreshAir:
+            relais_1_status = 0
+            ventFreshAir = True
+        else:
+            relais_1_status = 1
+            ventFreshAir = False
+                
     GPIO.output(relais_1_GPIO, relais_1_status)
 
     st1 = "ventilateFreshAir: {0:1d}".format(ventFreshAir)    
@@ -602,7 +779,7 @@ while True:
     
     if tDelta > tDeltaToReboot:
         if dtNow.hour > 18:
-            debugPrint("shutdown pending....")
+            debugPrint("multisensor shutdown pending....")
             #os.system('sudo reboot -h now') #at evening
 
     st1 = "seconds2wait: {0:1f}".format(secondsDiff)
@@ -618,7 +795,7 @@ while True:
     time.sleep(secondsDiff)  #was 20
 
 root.quit()
-debugPrint("unerwartetes Ende!!!")
+debugPrint("multisensor unerwartetes Ende!!!")
 client.loop_stop()
 client.disconnect()
 
