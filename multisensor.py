@@ -26,14 +26,23 @@ from adafruit_bme280 import basic as adafruit_bme280              #has nearly a 
 import adafruit_bmp3xx
 from digitalio import DigitalInOut, Direction
 import adafruit_bh1750
-import adafruit_ads1x15.ads1115 as ADS
 import adafruit_ccs811
-from adafruit_ads1x15.analog_in import AnalogIn
+import adafruit_sht31d
 from adafruit_htu21d import HTU21D
 
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
+#derzeit sind noch andere ads1x15 Bibliotheken installiert -
+#referenziert wird die adafruit_circuitpython_ads1x15 ohne Großbuchstaben im Namen!
 
 import math, struct, array, fcntl
 import RPi.GPIO as GPIO
+
+#Einrichten von autostart
+#--> https://techgeeks.de/raspberry-pi-autostart-von-programmen/
+#--> www.netzmafia.de/skripten/hardware/RaspPi/RasPi_Auto.html
+#--> http://christian-brauweiler.de/autostart-unter-raspian/  So läuft es
+# über /home/pi/.config/lxsession/LXDE-pi/autostart
 
 #configuration
 winOut = True
@@ -43,9 +52,10 @@ useBMP280 = False
 useBME280 = False
 useBME280ext = False
 useBMP3xx = True
-useBMP3xx_SPI = True
+useBMP3xx_SPI = False
 useLightSensor = True
 useHumiditySensor = True
+useSoilHumiditySensor = True
 useCO2Sensor = True
 useCCS811Sensor = True
 
@@ -62,12 +72,21 @@ GPIO.output(relais_1_GPIO, GPIO.LOW)
 GPIO.output(relais_2_GPIO, GPIO.LOW)
 
 # fresh air == O2 intake parameters - in Teilen von 1.0!
-O2concentration = 0.21
-O2minforFreshAir = 0.195
-O2hysteresis = 0.1
-relais_1_status = 1
-GPIO.output(relais_1_GPIO, relais_1_status)
+O2concentration = 0.205    # nachzuführen bei nachlassender Sensor Leistung --> kleiner werdend
+# Ausgangswert war wohl 0.21 zufälligerweise
+O2minforFreshAir = 0.195   # dto. mit Differenz von 1-2% absolutem O² Gehalt
+O2hysteresis = 0.1  #0.05        # dto. etwa die Hälfte der Differenz beider obiger O² Werte
+
+relais_1_status = 1# Achtung konträre Logik!!!
 ventFreshAir = False
+GPIO.output(relais_1_GPIO, relais_1_status)
+
+# maximaler CO2 Wert sollte dauerhaft 2.000 ppm nicht überschreiten?
+# bis 5.000ppm =0,5% darf man noch arbeiten
+# ab 40.000ppm wäre gesundheitsgefährdend (=Atemluft 4%) bis tödlich ~8%!!!
+# der aktuelle Lüfter mit 150mm bietet etwa 250 m³/h Luftstrom abzüglich Leitungsverluste
+# das GWH hat bei 10 m² Grundfläche und 2-2,5 m Höhe etwa 22 m³ Rauminhalt.
+# eine Minute Lüften saugt 3(-4) m³ Innenluft ab.
 
 # secondary inhouse fan parameters
 airTemp = 20.0
@@ -326,6 +345,11 @@ if useHumiditySensor == True:
     humiditymin = 100.0
     humiditymax = 0.0
 
+if useSoilHumiditySensor == True:
+    soilHumiditySensor = adafruit_sht31d.SHT31D(i2c)
+    soilHumiditymin = 100.0
+    soilHumiditymax = 0.0
+
 if useBMP280 == True:
     sensorBMP280 = adafruit_bmp280.Adafruit_BMP280_I2C(i2c, address=0x76)
 if useBME280 == True:
@@ -429,7 +453,7 @@ if winOut == True:
     root = Tk()
     root.title("Gewächshaus")
 
-    tW = Text(root, width = 50, height = 26)#, wrap = "none")
+    tW = Text(root, width = 50, height = 32)#, wrap = "none")
     tW.pack()
     #mainloop() # not appropriate
     #quellen --> https://stackoverflow.com/questions/54237067/how-to-make-tkinter-gui-thread-safe
@@ -609,8 +633,26 @@ while True:
             if MQTTout:
                 client.publish("gwh/temp", "{0:0.1f}".format(tempHum))
                 client.publish("gwh/humidity", "{0:0.1f}".format(relHum))
-        except Exceptio as exc:
+        except Exception as exc:
             exceptionPrint(exc, "Humidity Exception")
+    
+    if useSoilHumiditySensor == True:
+        try:
+            tempHum = soilHumiditySensor.temperature
+            relHum = soilHumiditySensor.relative_humidity
+            st1 = "Bodentemperatur: {0:0.1f} °C".format(tempHum)
+            st2 = "Bodenfeuchte: {0:0.1f} %".format(relHum)
+            if winOut == True:
+                winPrint(tW, st1)
+                winPrint(tW, st2)
+            if shellOut == True:
+                shellPrint(st1)
+                shellPrint(st2)
+            if MQTTout:
+                client.publish("gwh/soiltemp", "{0:0.1f}".format(tempHum))
+                client.publish("gwh/soilhumidity", "{0:0.1f}".format(relHum))
+        except Exception as exc:
+            exceptionPrint(exc, "Soil Humidity Exception")
     
     # T6703 CO2 Daten
     if useCO2Sensor == True:
@@ -635,16 +677,22 @@ while True:
         try:
             eco2 = ccs811.eco2
             tvoc = ccs811.tvoc
-            #tempCCS = ccs811.temperature
+            tempCCS = ccs811.temperature
             st1 = "eCO2: {0:5d} ppm".format(eco2)
             st2 = "TVOC: {0:5d} ppm".format(tvoc)
+            st3 = "tempCCS: {0:0.1f} °C".format(tempCCS)
             if winOut == True:
                 winPrint(tW, st1)
                 winPrint(tW, st2)
+                winPrint(tW, st3)
             if shellOut == True:
                 shellPrint(st1)
                 shellPrint(st2)
-            #print("TempCCS: {0:0.1f} °C".format(tempCCS))        
+                shellPrint(st3)
+            if MQTTout:
+                client.publish("gwh/eCO2", "{0:5d}".format(eco2))
+                client.publish("gwh/TVOC", "{0:5d}".format(tvoc))
+                client.publish("gwh/tempCCS", "{0:0.1f} °C".format(tempCCS))
         except Exception as exc:
             exceptionPrint(exc, "CCS811 Exception")
  
@@ -724,18 +772,20 @@ while True:
         
     if ventFreshAir == True:
         if O2concentration > O2minforFreshAir + O2hysteresis:
+            # Beende Frischluftzufuhr
             relais_1_status = 1
             ventFreshAir = False
         else:
             relais_1_status = 0
             ventFreshAir = True
-    else:         #ventFreshAir == False
+    else:   #ventFreshAir == False
         if O2concentration > O2minforFreshAir:
-            relais_1_status = 0
-            ventFreshAir = True
-        else:
             relais_1_status = 1
             ventFreshAir = False
+        else:
+            # Starte Frischluftzufuhr
+            relais_1_status = 0
+            ventFreshAir = True
                 
     GPIO.output(relais_1_GPIO, relais_1_status)
 
@@ -744,8 +794,13 @@ while True:
         winPrint(tW, st1)
     if shellOut == True:
         print(st1)
-
-    if airTemp < airTempCooling:
+    if MQTTout:
+        if ventFreshAir:
+            client.publish("gwh/ventFreshAir", "1")
+        else:
+            client.publish("gwh/ventFreshAir", "0")
+ 
+    if airTemp > airTempCooling:
         relais_2_status = 1
         isCooling = False
     else:
@@ -754,13 +809,15 @@ while True:
         
     GPIO.output(relais_2_GPIO, relais_2_status)
     st1 = "isCooling: {0:1d}".format(isCooling)  
-    #st2 = "airTemp: {0:0.1f} °C".format(airTemp)    
     if winOut == True:
         winPrint(tW, st1)
-        #winPrint(tW, st2)
     if shellOut == True:
         shellPrint(st1)
-        #shellPrint(st2)
+    if MQTTout:
+        if isCooling:
+            client.publish("gwh/isCooling", "1")
+        else:
+            client.publish("gwh/isCooling", "0")
     
     dtNow = datetime.datetime.now()
     tDelta = dtNow - dt
